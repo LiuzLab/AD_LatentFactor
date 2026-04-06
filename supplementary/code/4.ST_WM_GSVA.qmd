@@ -1,0 +1,383 @@
+---
+title: "WM ssGSEA Validation of RF Cluster 2 Score"
+format: html
+---
+
+input data: /home/zhijiany/workdir/2026/0402_AD_PaperReviews/data/AD/ROSMAP_AD-N/ROSMAP_AMPAD_AD-N_counts.txt
+meta: /home/zhijiany/workdir/2026/0402_AD_PaperReviews/out/2.RF_score/ROSMAP_AMPAD_AD-N_meta_with_RF_scores.txt
+goal: calculate the correlation between RF classification probability for cluster 2 and WM scores using enriched WM siganture genes from supplementary table S4B /home/zhijiany/workdir/2026/0402_AD_PaperReviews/data/supplementary_table.xlsx, with those having t stats > 10
+
+```{r setup}
+rm(list=ls())
+library(readxl)
+library(GSVA)
+library(ggplot2)
+library(dplyr)
+
+outDir <- "/home/zhijiany/workdir/2026/0402_AD_PaperReviews/out/4.ST_WM_GSVA"
+dir.create(outDir, recursive = TRUE, showWarnings = FALSE)
+
+suppFile <- "/home/zhijiany/workdir/2026/0402_AD_PaperReviews/data/supplementary_table.xlsx"
+countFile <- "/home/zhijiany/workdir/2026/0402_AD_PaperReviews/data/AD/ROSMAP_AD-N/ROSMAP_AMPAD_AD-N_counts.txt"
+rfScoreFile <- "/home/zhijiany/workdir/2026/0402_AD_PaperReviews/out/2.RF_score/ROSMAP_AMPAD_AD-N_meta_with_RF_scores.txt"
+rfValidationFile <- "/home/zhijiany/workdir/2026/0402_AD_PaperReviews/out/2.RF_score/validation_summary.csv"
+rfPerclassFile <- "/home/zhijiany/workdir/2026/0402_AD_PaperReviews/out/2.RF_score/perclass_metrics.csv"
+
+theme_set(theme_bw())
+
+# cluster colors: 1=green, 2=blue, 3=red
+clus_colors <- c("1" = "#00BA38", "2" = "#619CFF", "3" = "#F8766D")
+```
+
+## Helper functions
+
+```{r helpers}
+run_ssgsea_safe <- function(expr_mat, gene_sets) {
+  if ("ssgseaParam" %in% getNamespaceExports("GSVA")) {
+    param <- GSVA::ssgseaParam(exprData = expr_mat, geneSets = gene_sets,
+                               alpha = 0.25,
+                               normalize = TRUE)
+    ssgsea_res <- GSVA::gsva(param, verbose = FALSE)
+  } else {
+    ssgsea_res <- GSVA::gsva(expr = expr_mat, gset.idx.list = gene_sets,
+                             method = "ssgsea",
+                             ssgsea.norm = TRUE,
+                             verbose = FALSE)
+  }
+
+  as.numeric(ssgsea_res[1, ])
+}
+
+compute_correlations <- function(df, cohort_name) {
+  tmp <- df |>
+    filter(!is.na(RF_score_clus2), !is.na(WM_ssGSEA_score))
+
+  if (nrow(tmp) < 3 ||
+      length(unique(tmp$RF_score_clus2)) < 2 ||
+      length(unique(tmp$WM_ssGSEA_score)) < 2) {
+    return(data.frame(
+      cohort = cohort_name,
+      n = nrow(tmp),
+      spearman_rho = NA_real_,
+      spearman_p = NA_real_,
+      pearson_r = NA_real_,
+      pearson_p = NA_real_,
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  spearman_test <- cor.test(tmp$RF_score_clus2, tmp$WM_ssGSEA_score,
+                            method = "spearman", exact = FALSE)
+  pearson_test <- cor.test(tmp$RF_score_clus2, tmp$WM_ssGSEA_score,
+                           method = "pearson")
+
+  data.frame(
+    cohort = cohort_name,
+    n = nrow(tmp),
+    spearman_rho = unname(spearman_test$estimate),
+    spearman_p = spearman_test$p.value,
+    pearson_r = unname(pearson_test$estimate),
+    pearson_p = pearson_test$p.value,
+    stringsAsFactors = FALSE
+  )
+}
+
+fmt_p <- function(x) {
+  ifelse(x < 2.2e-16, "<2.2e-16", formatC(x, format = "e", digits = 2))
+}
+
+compute_boxplot_stats <- function(df) {
+  plot_df <- df |>
+    filter(!is.na(RF_predicted_clus), !is.na(WM_ssGSEA_score)) |>
+    mutate(RF_predicted_clus = factor(RF_predicted_clus))
+
+  kw_test <- kruskal.test(WM_ssGSEA_score ~ RF_predicted_clus, data = plot_df)
+
+  group_levels <- levels(plot_df$RF_predicted_clus)
+  pair_df <- utils::combn(group_levels, 2, simplify = FALSE) |>
+    lapply(function(pair) {
+      pair_data <- plot_df |>
+        filter(RF_predicted_clus %in% pair)
+      pair_test <- wilcox.test(WM_ssGSEA_score ~ RF_predicted_clus, data = pair_data,
+                               exact = FALSE)
+      data.frame(
+        group1 = pair[[1]],
+        group2 = pair[[2]],
+        p_value = pair_test$p.value,
+        stringsAsFactors = FALSE
+      )
+    }) |>
+    bind_rows() |>
+    mutate(
+      xmin = match(group1, group_levels),
+      xmax = match(group2, group_levels)
+    )
+
+  y_max <- max(plot_df$WM_ssGSEA_score, na.rm = TRUE)
+  y_min <- min(plot_df$WM_ssGSEA_score, na.rm = TRUE)
+  y_range <- y_max - y_min
+  if (!is.finite(y_range) || y_range == 0) {
+    y_range <- max(abs(y_max), 1)
+  }
+  step_height <- 0.08 * y_range
+  tick_height <- 0.015 * y_range
+  label_offset <- 0.02 * y_range
+
+  pair_df <- pair_df |>
+    arrange(xmin, xmax) |>
+    mutate(
+      y = y_max + step_height * seq_len(n()),
+      tick_y = y - tick_height,
+      label_y = y + label_offset,
+      label = paste0("Wilcoxon p=", fmt_p(p_value))
+    )
+
+  list(
+    plot_df = plot_df,
+    kw_label = paste0(
+      "Kruskal-Wallis chi-squared=", sprintf("%.2f", unname(kw_test$statistic)),
+      ", p=", fmt_p(kw_test$p.value)
+    ),
+    y_min = y_min,
+    kw_y = y_max + step_height * (nrow(pair_df) + 1.2),
+    y_upper = y_max + step_height * (nrow(pair_df) + 2.2),
+    pair_df = pair_df
+  )
+}
+```
+
+## Load RF-scored metadata and counts
+
+```{r load-data}
+metaDf <- read.table(rfScoreFile, header = TRUE, sep = "\t",
+                     stringsAsFactors = FALSE, check.names = FALSE)
+metaDf$sample_id <- sub("^X", "", metaDf$newId)
+
+countDf <- read.table(countFile, header = TRUE, sep = "\t",
+                      stringsAsFactors = FALSE, check.names = FALSE)
+rownames(countDf) <- countDf[, 1]
+countDf <- as.matrix(countDf[, -1])
+storage.mode(countDf) <- "numeric"
+
+stopifnot(all(metaDf$sample_id %in% colnames(countDf)))
+metaDf <- metaDf[match(colnames(countDf), metaDf$sample_id), ]
+stopifnot(all(metaDf$sample_id == colnames(countDf)))
+
+cat("Samples in metadata:", nrow(metaDf), "\n")
+cat("Samples in counts:", ncol(countDf), "\n")
+print(table(metaDf$study))
+```
+
+## Load WM signature from Supplementary Table S4B
+
+```{r signature}
+wmSigRaw <- read_excel(suppFile, sheet = "Table S4B")
+wmSigRaw <- as.data.frame(wmSigRaw, stringsAsFactors = FALSE)
+
+wmSigDf <- wmSigRaw |>
+  select(ensembl, gene, t_stat_WM, p_value_WM, fdr_WM) |>
+  filter(!is.na(ensembl), !is.na(t_stat_WM), t_stat_WM > 10) |>
+  arrange(desc(t_stat_WM))
+
+wmGenesAll <- unique(wmSigDf$ensembl)
+wmGenesPresent <- intersect(wmGenesAll, rownames(countDf))
+wmGenesMissing <- setdiff(wmGenesAll, rownames(countDf))
+
+cat("WM signature genes (t_stat_WM > 10):", length(wmGenesAll), "\n")
+cat("Present in counts:", length(wmGenesPresent), "\n")
+cat("Missing from counts:", length(wmGenesMissing), "\n")
+
+stopifnot(length(wmGenesAll) == 302)
+stopifnot(length(wmGenesPresent) == 299)
+stopifnot(length(wmGenesMissing) == 3)
+
+wmSigPresentDf <- wmSigDf |> filter(ensembl %in% wmGenesPresent)
+wmSigMissingDf <- wmSigDf |> filter(ensembl %in% wmGenesMissing)
+
+write.table(wmSigPresentDf,
+            file = file.path(outDir, "WM_signature_genes_tstat_gt10_present.txt"),
+            sep = "\t", row.names = FALSE, quote = FALSE)
+write.table(wmSigMissingDf,
+            file = file.path(outDir, "WM_signature_genes_tstat_gt10_missing.txt"),
+            sep = "\t", row.names = FALSE, quote = FALSE)
+
+summaryLines <- c(
+  paste("WM signature genes with t_stat_WM > 10:", length(wmGenesAll)),
+  paste("Present in counts:", length(wmGenesPresent)),
+  paste("Missing from counts:", length(wmGenesMissing)),
+  paste("Missing genes:", paste(wmSigMissingDf$gene, collapse = ", "))
+)
+writeLines(summaryLines, con = file.path(outDir, "WM_signature_summary.txt"))
+wmSigMissingDf
+```
+
+## Prepare expression matrix for ssGSEA
+
+The ROSMAP matrix is already continuous normalized expression, so we use it
+directly for ssGSEA rather than re-running count-based normalization. Because
+ssGSEA is based on within-sample gene ranks, we score the combined matrix once
+across all samples and keep the default ssGSEA normalization enabled
+(`normalize = TRUE` or `ssgsea.norm = TRUE`) so WM enrichment scores are on a
+more comparable cross-sample scale for visualization and downstream summaries.
+
+```{r expression-matrix}
+exprMat <- countDf
+
+stopifnot(identical(colnames(exprMat), metaDf$sample_id))
+stopifnot(identical(rownames(exprMat), rownames(countDf)))
+
+normSummaryDf <- metaDf |>
+  count(study, name = "n_samples")
+write.table(normSummaryDf, file = file.path(outDir, "cohort_sample_counts.txt"),
+            sep = "\t", row.names = FALSE, quote = FALSE)
+
+summary(as.numeric(exprMat[, 1:5]))
+```
+
+## Compute WM ssGSEA score per sample
+
+```{r ssgsea-score}
+wmScores <- run_ssgsea_safe(
+  expr_mat = exprMat,
+  gene_sets = list(WM_signature = wmGenesPresent)
+)
+
+gsvaDf <- data.frame(
+  sample_id = colnames(exprMat),
+  WM_ssGSEA_score = wmScores,
+  stringsAsFactors = FALSE
+)
+
+resDf <- metaDf |>
+  left_join(gsvaDf, by = "sample_id")
+
+stopifnot(sum(is.na(resDf$WM_ssGSEA_score)) == 0)
+stopifnot(sum(is.na(resDf$RF_score_clus2)) == 0)
+
+write.table(resDf,
+            file = file.path(outDir, "ROSMAP_AMPAD_AD-N_meta_with_RF_and_ssGSEA_scores.txt"),
+            sep = "\t", row.names = FALSE, quote = FALSE)
+
+summary(resDf$WM_ssGSEA_score)
+```
+
+## Correlation between ssGSEA WM score and RF cluster 2 score
+
+```{r correlations}
+corSummaryDf <- bind_rows(
+  compute_correlations(resDf, "Pooled"),
+  compute_correlations(filter(resDf, study == "MAP"), "MAP"),
+  compute_correlations(filter(resDf, study == "ROS"), "ROS")
+)
+
+corSummaryDf$label <- paste0(
+  corSummaryDf$cohort,
+  ": rho=", sprintf("%.3f", corSummaryDf$spearman_rho),
+  ", p=", fmt_p(corSummaryDf$spearman_p),
+  ", n=", corSummaryDf$n
+)
+
+write.table(corSummaryDf,
+            file = file.path(outDir, "WM_ssGSEA_vs_RF_score_correlations.txt"),
+            sep = "\t", row.names = FALSE, quote = FALSE)
+
+corSummaryDf
+```
+
+## Reviewer-facing figures
+
+```{r figures}
+pooled_label <- corSummaryDf$label[corSummaryDf$cohort == "Pooled"]
+
+p_scatter <- ggplot(resDf, aes(x = RF_score_clus2, y = WM_ssGSEA_score, color = study)) +
+  geom_point(size = 2.2, alpha = 0.8) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.8) +
+  geom_smooth(
+    data = resDf,
+    aes(x = RF_score_clus2, y = WM_ssGSEA_score),
+    inherit.aes = FALSE,
+    method = "lm", se = FALSE, color = "black",
+    linetype = "dashed", linewidth = 0.9
+  ) +
+  annotate("text", x = Inf, y = -Inf, label = pooled_label,
+           hjust = 1.05, vjust = -0.8, size = 3.7) +
+  labs(
+    title = "WM ssGSEA score tracks RF cluster 2 score",
+    subtitle = "Colored lines: cohort-specific fits; dashed black line: pooled fit",
+    x = "RF_score_clus2",
+    y = "WM ssGSEA score",
+    color = "Cohort"
+  )
+
+ggsave(file.path(outDir, "WM_ssGSEA_vs_RF_score_scatter.pdf"),
+       p_scatter, width = 5.8, height = 5.8)
+
+p_dist <- ggplot(resDf, aes(x = study, y = WM_ssGSEA_score, fill = study)) +
+  geom_violin(trim = FALSE, alpha = 0.5, color = NA) +
+  geom_boxplot(width = 0.18, outlier.shape = NA, alpha = 0.85) +
+  labs(
+    title = "Distribution of WM ssGSEA scores by cohort",
+    x = "Cohort",
+    y = "WM ssGSEA score",
+    fill = "Cohort"
+  ) +
+  guides(fill = "none")
+
+ggsave(file.path(outDir, "WM_ssGSEA_score_by_cohort.pdf"),
+       p_dist, width = 5.5, height = 5)
+
+clusterStatList <- compute_boxplot_stats(resDf)
+
+p_cluster <- ggplot(clusterStatList$plot_df,
+                    aes(x = RF_predicted_clus, y = WM_ssGSEA_score,
+                        fill = RF_predicted_clus)) +
+  geom_boxplot(alpha = 0.8, outlier.shape = NA) +
+  geom_jitter(width = 0.12, alpha = 0.35, size = 1.2) +
+  geom_segment(data = clusterStatList$pair_df,
+               aes(x = xmin, xend = xmax, y = y, yend = y),
+               inherit.aes = FALSE, linewidth = 0.5) +
+  geom_segment(data = clusterStatList$pair_df,
+               aes(x = xmin, xend = xmin, y = tick_y, yend = y),
+               inherit.aes = FALSE, linewidth = 0.5) +
+  geom_segment(data = clusterStatList$pair_df,
+               aes(x = xmax, xend = xmax, y = tick_y, yend = y),
+               inherit.aes = FALSE, linewidth = 0.5) +
+  geom_text(data = clusterStatList$pair_df,
+            aes(x = (xmin + xmax) / 2, y = label_y, label = label),
+            inherit.aes = FALSE, size = 3.1) +
+  annotate("text", x = 2, y = clusterStatList$kw_y, label = clusterStatList$kw_label,
+           size = 3.3) +
+  coord_cartesian(ylim = c(clusterStatList$y_min, clusterStatList$y_upper)) +
+  scale_fill_manual(values = clus_colors) +
+  labs(
+    title = "WM ssGSEA score by RF-predicted cluster",
+    x = "RF-predicted cluster",
+    y = "WM ssGSEA score",
+    fill = "RF cluster"
+  )
+
+ggsave(file.path(outDir, "WM_ssGSEA_score_by_RF_predicted_cluster.pdf"),
+       p_cluster, width = 6.2, height = 5)
+
+p_scatter
+```
+
+## Existing RF validation metrics
+
+```{r rf-validation}
+rfValidationDf <- read.csv(rfValidationFile, stringsAsFactors = FALSE)
+rfPerclassDf <- read.csv(rfPerclassFile, stringsAsFactors = FALSE)
+
+write.table(rfValidationDf,
+            file = file.path(outDir, "RF_validation_summary_reused.txt"),
+            sep = "\t", row.names = FALSE, quote = FALSE)
+write.table(rfPerclassDf,
+            file = file.path(outDir, "RF_perclass_metrics_reused.txt"),
+            sep = "\t", row.names = FALSE, quote = FALSE)
+
+rfValidationDf
+```
+
+```{r}
+rfPerclassDf
+```

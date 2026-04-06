@@ -1,0 +1,309 @@
+
+
+
+Train Random Forest on MAP samples only, extract OOB vote probabilities (cluster scores), and predict on ROS samples using the MAP-trained model.
+
+The original code only saved the predicted class labels (`clus` in meta), not the probability scores. Here we train the RF on MAP cohort and extract `rfModel$votes` — the out-of-bag vote fractions per class for MAP. For ROS samples, we apply the trained model to get predicted probabilities.
+
+Need:
+1. ROSMAP count matrix and metadata
+2. gene_order.rds (gene filtering order from original analysis)
+3. randomForest, pROC, ggplot2 packages
+
+```{r}
+rm(list=ls())
+
+library(randomForest)
+library(dplyr)
+library(pROC)
+library(ggplot2)
+
+set.seed(14)
+
+# cluster colors: 1=green, 2=blue, 3=red
+clus_colors <- c("1" = "#00BA38", "2" = "#619CFF", "3" = "#F8766D")
+
+data_dir <- "/home/zhijiany/workdir/2026/0402_AD_PaperReviews/data/AD"
+out_dir <- "/home/zhijiany/workdir/2026/0402_AD_PaperReviews/out/2.RF_score"
+```
+
+## Load data
+
+```{r}
+countDF <- read.csv(file.path(data_dir, "ROSMAP_AD-N/ROSMAP_AMPAD_AD-N_counts.txt"),
+                    sep = '\t', row.names = 1, stringsAsFactors = FALSE)
+metaDf <- read.csv(file.path(data_dir, "ROSMAP_AD-N/ROSMAP_AMPAD_AD-N_meta.txt"),
+                   sep = '\t', stringsAsFactors = FALSE)
+metaDf$newId <- paste0('X', metaDf$newId)
+
+dim(countDF)
+table(metaDf$clus)
+table(metaDf$study)
+```
+
+## Filter to signature genes
+
+```{r}
+sig_gene <- readRDS(file.path(data_dir, "gene_order.rds"))
+countDF <- countDF[sig_gene, ]
+dim(countDF)
+```
+
+## Z-scale MAP and ROS separately (using MAP statistics)
+
+```{r}
+map_idx <- which(metaDf$study == "MAP")
+ros_idx <- which(metaDf$study == "ROS")
+
+map_samples <- metaDf$newId[map_idx]
+ros_samples <- metaDf$newId[ros_idx]
+
+# z-scale using MAP statistics
+map_counts <- countDF[, map_samples]
+ros_counts <- countDF[, ros_samples]
+
+gene_means <- rowMeans(map_counts)
+gene_sds   <- apply(map_counts, 1, sd)
+gene_sds[gene_sds == 0] <- 1
+
+map_z <- as.data.frame(t((map_counts - gene_means) / gene_sds))
+ros_z <- as.data.frame(t((ros_counts - gene_means) / gene_sds))
+
+cat("MAP samples:", nrow(map_z), "\n")
+cat("ROS samples:", nrow(ros_z), "\n")
+```
+
+---
+
+# Train Random Forest on MAP samples
+
+## Train and OOB evaluation
+
+```{r}
+set.seed(14)
+train_data <- map_z
+train_data$clus <- as.factor(metaDf$clus[map_idx])
+
+mtrySel <- sqrt(ncol(map_z))
+rfModel <- randomForest(clus ~ ., data = train_data,
+                        importance = TRUE, ntree = 200, mtry = mtrySel)
+
+confusion <- rfModel$confusion
+confusion
+acc <- (confusion[1, 1] + confusion[2, 2] + confusion[3, 3]) / sum(confusion[, 1:3])
+cat("Overall OOB accuracy:", round(acc, 4), "\n")
+```
+
+## OOB metrics: per-class accuracy, multiclass AUC
+
+```{r}
+# OOB predictions and votes
+oob_pred <- rfModel$predicted
+oob_votes <- rfModel$votes
+true_labels <- as.factor(metaDf$clus[map_idx])
+
+# per-class OOB error rate (from confusion matrix)
+cat("Per-class OOB error rates:\n")
+for (i in 1:3) {
+  cat(sprintf("  Cluster %d: %.4f (accuracy: %.4f)\n",
+              i, confusion[i, 4], 1 - confusion[i, 4]))
+}
+
+# multiclass AUC (one-vs-rest) using OOB votes
+auc_results <- data.frame(class = 1:3, auc = NA)
+for (i in 1:3) {
+  binary_true <- ifelse(true_labels == i, 1, 0)
+  roc_obj <- roc(binary_true, oob_votes[, i], quiet = TRUE)
+  auc_results$auc[i] <- auc(roc_obj)
+  cat(sprintf("  Cluster %d AUC: %.4f\n", i, auc(roc_obj)))
+}
+cat(sprintf("  Mean AUC (macro): %.4f\n", mean(auc_results$auc)))
+```
+
+## Extract OOB scores (MAP) and predict scores (ROS)
+
+```{r}
+# OOB scores for MAP samples
+map_scores <- as.data.frame(rfModel$votes)
+colnames(map_scores) <- paste0("RF_score_clus", colnames(map_scores))
+map_scores$newId <- map_samples
+map_scores$RF_predicted_clus <- rfModel$predicted
+
+# Predict on ROS samples
+ros_pred_prob  <- predict(rfModel, ros_z, type = "prob")
+ros_pred_class <- predict(rfModel, ros_z, type = "class")
+
+ros_scores <- as.data.frame(ros_pred_prob)
+colnames(ros_scores) <- paste0("RF_score_clus", colnames(ros_scores))
+ros_scores$newId <- ros_samples
+ros_scores$RF_predicted_clus <- ros_pred_class
+
+# Combine
+all_scores <- rbind(map_scores, ros_scores)
+head(all_scores)
+```
+
+## Merge scores back into metadata
+
+```{r}
+metaDf_scored <- metaDf |>
+  left_join(all_scores, by = "newId")
+
+table(Original = metaDf_scored$clus, RF_predicted = metaDf_scored$RF_predicted_clus)
+
+head(metaDf_scored[, c("newId", "study", "clus", "RF_predicted_clus",
+                       "RF_score_clus1", "RF_score_clus2", "RF_score_clus3")])
+```
+
+---
+
+# OOB confidence distributions (MAP samples)
+
+```{r}
+conf_df <- data.frame(
+  newId = map_samples,
+  study = metaDf$study[map_idx],
+  true_clus = as.factor(metaDf$clus[map_idx]),
+  predicted_clus = rfModel$predicted,
+  max_prob = apply(rfModel$votes, 1, max)
+)
+conf_df$correct <- conf_df$true_clus == conf_df$predicted_clus
+
+cat("OOB confidence summary (MAP):\n")
+conf_df |>
+  summarise(
+    n = n(),
+    mean_confidence = round(mean(max_prob), 4),
+    median_confidence = round(median(max_prob), 4),
+    accuracy = round(mean(correct), 4)
+  )
+```
+
+## Confidence distribution by cluster
+
+```{r, fig.width=8, fig.height=5}
+p1 <- ggplot(conf_df, aes(x = true_clus, y = max_prob, fill = true_clus)) +
+  geom_violin(alpha = 0.6) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.8) +
+  geom_jitter(width = 0.1, size = 1, alpha = 0.4) +
+  scale_fill_manual(values = clus_colors) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(title = "RF Prediction Confidence by Cluster (OOB, MAP samples)",
+       x = "Cluster", y = "Max Class Probability") +
+  theme_bw() +
+  theme(legend.position = "none")
+print(p1)
+
+ggsave(file.path(out_dir, "confidence_by_cluster_oob.pdf"), p1,
+       width = 6, height = 4)
+```
+
+## Full probability distribution by true cluster (all 3 scores per sample)
+
+```{r, fig.width=10, fig.height=8}
+n_map <- length(map_idx)
+votes_long <- data.frame(
+  newId = rep(map_samples, 3),
+  true_clus = rep(as.factor(metaDf$clus[map_idx]), 3),
+  predicted_clus = factor(rep(1:3, each = n_map),
+                          labels = paste("Score: Cluster", 1:3)),
+  prob = c(rfModel$votes[, 1],
+           rfModel$votes[, 2],
+           rfModel$votes[, 3])
+)
+
+p2 <- ggplot(votes_long, aes(x = predicted_clus, y = prob, fill = predicted_clus)) +
+  geom_violin(alpha = 0.6) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.8) +
+  geom_jitter(width = 0.1, size = 0.8, alpha = 0.3) +
+  facet_wrap(~ true_clus,
+             labeller = labeller(true_clus = function(x) paste("True Cluster", x))) +
+  scale_fill_manual(values = setNames(clus_colors, paste("Score: Cluster", 1:3))) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(title = "OOB Vote Probabilities for All Clusters by True Cluster (MAP)",
+       x = "", y = "OOB Vote Probability") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 30, hjust = 1))
+print(p2)
+
+ggsave(file.path(out_dir, "votes_by_true_cluster_oob.pdf"), p2,
+       width = 10, height = 8)
+```
+
+## ROC curves (OOB)
+
+```{r, fig.width=5, fig.height=4.5}
+clus_colors <- c("1" = "#00BA38", "2" = "#619CFF", "3" = "#F8766D")
+
+roc_list <- lapply(1:3, function(i) {
+  binary_true <- ifelse(true_labels == i, 1, 0)
+  roc_obj <- roc(binary_true, oob_votes[, i], quiet = TRUE)
+  data.frame(
+    sensitivity = roc_obj$sensitivities,
+    fpr = 1 - roc_obj$specificities,
+    cluster_id = as.character(i),
+    auc_label = paste0("Cluster ", i, " (AUC=", round(auc(roc_obj), 3), ")")
+  )
+})
+roc_df <- do.call(rbind, roc_list)
+
+p_roc <- ggplot(roc_df, aes(x = fpr, y = sensitivity, color = cluster_id)) +
+  geom_line(linewidth = 0.8) +
+  geom_abline(linetype = "dashed", color = "grey50") +
+  scale_color_manual(values = clus_colors,
+                     labels = unique(roc_df$auc_label)) +
+  scale_x_continuous(name = "False Positive Rate") +
+  scale_y_continuous(name = "True Positive Rate") +
+  labs(title = "ROC Curves — OOB (MAP samples)", color = "") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+print(p_roc)
+
+ggsave(file.path(out_dir, "roc_curves_oob.pdf"), p_roc,
+       width = 5, height = 4.5)
+```
+
+---
+
+# Summary metrics
+
+```{r}
+summary_table <- data.frame(
+  Validation = "OOB (MAP-trained model)",
+  Accuracy = round(acc, 4),
+  Mean_AUC = round(mean(auc_results$auc), 4)
+)
+print(summary_table)
+
+write.csv(summary_table, file.path(out_dir, "validation_summary.csv"),
+          row.names = FALSE)
+```
+
+## Save confusion matrix
+
+```{r}
+sink(file.path(out_dir, "confusion_matrices.txt"))
+cat("=== OOB (MAP-trained model) ===\n")
+print(rfModel$confusion)
+sink()
+
+write.csv(conf_df, file.path(out_dir, "oob_confidence.csv"),
+          row.names = FALSE)
+
+cat("Saved: validation_summary.csv, confusion_matrices.txt, oob_confidence.csv\n")
+```
+
+---
+
+# Save results
+
+```{r}
+write.table(metaDf_scored,
+            file.path(out_dir, "ROSMAP_AMPAD_AD-N_meta_with_RF_scores.txt"),
+            sep = '\t', row.names = FALSE, quote = FALSE)
+
+saveRDS(rfModel, file.path(out_dir, "rfModel_clus.rds"))
+
+cat("All outputs saved to:", out_dir, "\n")
+```
