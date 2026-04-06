@@ -1,0 +1,574 @@
+
+Perform DEG analysis using WM score as a covariate
+
+```{r setup}
+rm(list=ls())
+library(limma)
+library(ggplot2)
+library(VennDiagram)
+
+outDir <- "/home/zhijiany/workdir/2026/0402_AD_PaperReviews/out/3.DEG_w_covariate"
+dir.create(outDir, recursive = TRUE, showWarnings = FALSE)
+
+dataDir <- "/home/zhijiany/workdir/2026/0402_AD_PaperReviews/data/AD/ROSMAP_AD-N"
+rfScoreFile <- "/home/zhijiany/workdir/2026/0402_AD_PaperReviews/out/2.RF_score/ROSMAP_AMPAD_AD-N_meta_with_RF_scores.txt"
+```
+
+## Load data
+
+```{r load-data}
+# Gene ID to symbol mapping
+geneIDNameDf <- read.table(file.path(dataDir, "ensId_symbol_map.txt"),
+                           header = TRUE, sep = "\t", stringsAsFactors = FALSE,
+                           check.names = FALSE)
+
+# Metadata with RF scores
+metaDf <- read.table(rfScoreFile, header = TRUE, sep = "\t",
+                     stringsAsFactors = FALSE, check.names = FALSE)
+# RF scores file has X-prefixed newId (e.g. X173_120424); strip to match counts columns
+metaDf$newId <- sub("^X", "", metaDf$newId)
+dim(metaDf)
+table(metaDf$diag)
+table(metaDf$clus)
+
+# Count matrix
+countDf <- read.table(file.path(dataDir, "ROSMAP_AMPAD_AD-N_counts.txt"),
+                      header = TRUE, sep = "\t", stringsAsFactors = FALSE,
+                      check.names = FALSE)
+rownames(countDf) <- countDf[, 1]
+countDf <- countDf[, -1]
+dim(countDf)
+```
+
+## Inspect RF scores
+
+Cluster 2 = WM-related, Clusters 1 & 3 = GM-related.
+RF scores sum to 1 per sample, so we use `RF_score_clus2` as the WM score covariate.
+
+```{r inspect-scores}
+summary(metaDf[, c("RF_score_clus1", "RF_score_clus2", "RF_score_clus3")])
+
+# Verify scores sum to ~1
+range(metaDf$RF_score_clus1 + metaDf$RF_score_clus2 + metaDf$RF_score_clus3)
+
+# Distribution of WM score by diagnosis
+ggplot(metaDf, aes(x = diag, y = RF_score_clus2)) +
+  geom_boxplot() +
+  labs(title = "WM score (RF_score_clus2) by diagnosis", y = "WM score") +
+  theme_bw()
+```
+
+## Check correlation between diagnosis and WM score
+
+```{r diag-wm-correlation, fig.width=7, fig.height=5}
+metaCorrDf <- metaDf
+metaCorrDf$diag <- factor(metaCorrDf$diag, levels = c("N", "AD"))
+metaCorrDf$diag_num <- ifelse(metaCorrDf$diag == "AD", 1, 0)
+
+pearson_cor <- cor(metaCorrDf$diag_num, metaCorrDf$RF_score_clus2, method = "pearson")
+spearman_cor <- cor(metaCorrDf$diag_num, metaCorrDf$RF_score_clus2, method = "spearman")
+t_test_res <- t.test(RF_score_clus2 ~ diag, data = metaCorrDf)
+wilcox_res <- wilcox.test(RF_score_clus2 ~ diag, data = metaCorrDf)
+
+cat("Diagnosis vs RF_score_clus2 association\n")
+cat("  Pearson correlation (diag coded N=0, AD=1):", round(pearson_cor, 4), "\n")
+cat("  Spearman correlation (diag coded N=0, AD=1):", round(spearman_cor, 4), "\n")
+cat("  Mean RF_score_clus2 in N:", round(mean(metaCorrDf$RF_score_clus2[metaCorrDf$diag == "N"]), 4), "\n")
+cat("  Mean RF_score_clus2 in AD:", round(mean(metaCorrDf$RF_score_clus2[metaCorrDf$diag == "AD"]), 4), "\n")
+cat("  t-test p-value:", signif(t_test_res$p.value, 4), "\n")
+cat("  Wilcoxon p-value:", signif(wilcox_res$p.value, 4), "\n")
+
+p_diag_wm <- ggplot(metaCorrDf, aes(x = diag, y = RF_score_clus2, fill = diag)) +
+  geom_boxplot(width = 0.6, alpha = 0.8, outlier.shape = NA) +
+  geom_jitter(width = 0.12, alpha = 0.5, size = 1.5) +
+  scale_fill_manual(values = c("N" = "#7AA6DC", "AD" = "#D97A6C")) +
+  labs(
+    title = "Association between diagnosis and WM score",
+    subtitle = paste0(
+      "Pearson r = ", round(pearson_cor, 3),
+      "; Spearman rho = ", round(spearman_cor, 3),
+      "; t-test p = ", signif(t_test_res$p.value, 3)
+    ),
+    x = "Diagnosis",
+    y = "RF_score_clus2"
+  ) +
+  theme_bw() +
+  theme(legend.position = "none")
+
+ggsave(file.path(outDir, "diag_vs_RF_score_clus2.pdf"), p_diag_wm, width = 6, height = 5)
+
+p_diag_wm
+```
+
+## Helper: run limma and save results
+
+```{r helper-functions}
+run_limma <- function(countDf, design, coef, geneIDNameDf,
+                      padjCut = 0.05, logFCCut = 0.26) {
+  fit <- lmFit(countDf, design)
+  fit <- eBayes(fit)
+  fitRes <- topTable(fit, coef = coef, adjust = "BH", n = Inf)
+
+  resDf <- data.frame(ensid = rownames(fitRes), fitRes, check.names = FALSE)
+  resDf <- merge(resDf, geneIDNameDf, by.x = "ensid", by.y = "ensid", all.x = TRUE)
+  resDf <- resDf[order(resDf$adj.P.Val), ]
+
+  sig <- resDf[resDf$adj.P.Val <= padjCut, ]
+  up <- sig[sig$logFC >= logFCCut, ]
+  dn <- sig[sig$logFC <= -logFCCut, ]
+
+  cat("Total genes tested:", nrow(resDf), "\n")
+  cat("Significant (adj.P <=", padjCut, "):", nrow(sig), "\n")
+  cat("  Up (logFC >=", logFCCut, "):", nrow(up), "\n")
+  cat("  Down (logFC <=", -logFCCut, "):", nrow(dn), "\n")
+
+  list(all = resDf, sig = sig, up = up, dn = dn)
+}
+
+save_deg_results <- function(res, prefix, outDir) {
+  write.table(res$all, file = file.path(outDir, paste0(prefix, "_all.txt")),
+              sep = "\t", row.names = FALSE, quote = FALSE)
+  write.table(res$up, file = file.path(outDir, paste0(prefix, "_up.txt")),
+              sep = "\t", row.names = FALSE, quote = FALSE)
+  write.table(res$dn, file = file.path(outDir, paste0(prefix, "_down.txt")),
+              sep = "\t", row.names = FALSE, quote = FALSE)
+}
+
+prepare_logfc_distribution_df <- function(df, label, padjCut = 0.05, logFCCut = 0.26) {
+  df$significance <- "Not significant"
+  df$significance[df$adj.P.Val <= padjCut & df$logFC >= logFCCut] <- "Up"
+  df$significance[df$adj.P.Val <= padjCut & df$logFC <= -logFCCut] <- "Down"
+  df$significance <- factor(df$significance, levels = c("Down", "Not significant", "Up"))
+  df$comparison <- label
+  df
+}
+
+prepare_pvalue_distribution_df <- function(df, label, padjCut = 0.05, logFCCut = 0.26) {
+  df$significance <- "Not significant"
+  df$significance[df$adj.P.Val <= padjCut & df$logFC >= logFCCut] <- "Up"
+  df$significance[df$adj.P.Val <= padjCut & df$logFC <= -logFCCut] <- "Down"
+  df$significance <- factor(df$significance, levels = c("Down", "Not significant", "Up"))
+  df$comparison <- label
+  df
+}
+
+run_go_bp <- function(gene_df, title, out_prefix, outDir) {
+  if (is.null(gene_df) || nrow(gene_df) == 0) {
+    cat("Skipping", title, "- no significant genes.\n")
+    return(invisible(NULL))
+  }
+
+  gene_ids <- unique(na.omit(gene_df$ensid))
+  if (length(gene_ids) == 0) {
+    cat("Skipping", title, "- no Ensembl IDs available for enrichment.\n")
+    return(invisible(NULL))
+  }
+
+  go_obj <- enrichGO(
+    gene = gene_ids,
+    OrgDb = org.Hs.eg.db,
+    ont = "BP",
+    keyType = "ENSEMBL",
+    pAdjustMethod = "BH",
+    pvalueCutoff = 0.05
+  )
+
+  go_df <- data.frame(go_obj)
+  if (is.null(go_df) || nrow(go_df) == 0) {
+    cat("Skipping", title, "- enrichGO returned no terms.\n")
+    return(invisible(NULL))
+  }
+
+  p_go <- dotplot(go_obj, showCategory = 15, font.size = 8) +
+    ggtitle(title)
+  ggsave(file.path(outDir, paste0(out_prefix, ".pdf")), p_go, width = 8, height = 6)
+  write.table(go_df, file = file.path(outDir, paste0(out_prefix, ".txt")),
+              sep = "\t", row.names = FALSE, quote = FALSE)
+
+  invisible(go_obj)
+}
+```
+
+## Model 1: ~ diag + centered WM score
+
+Uses all samples. The WM score (`RF_score_clus2`) captures the GM/WM tissue composition as a continuous covariate. We center the WM score so the `diagAD` coefficient is interpretable as the AD vs N effect at the average WM score.
+
+```{r model1-wm-score}
+tmpDf <- metaDf
+tmpDf <- tmpDf[order(tmpDf$diag, decreasing = TRUE), ]
+tmpDf$diag <- factor(tmpDf$diag, levels = c("N", "AD"))
+tmpDf$WM_score_c <- as.numeric(scale(tmpDf$RF_score_clus2, center = TRUE, scale = FALSE))
+
+design1 <- model.matrix(~ diag + WM_score_c, data = tmpDf)
+rownames(design1) <- tmpDf$newId
+head(design1)
+
+countDf1 <- countDf[, match(rownames(design1), colnames(countDf))]
+stopifnot(all(colnames(countDf1) == rownames(design1)))
+
+cat("Model 1: ~ diag + WM_score_c\n")
+res_m1 <- run_limma(countDf1, design1, coef = "diagAD", geneIDNameDf)
+save_deg_results(res_m1, "DEG_model1_diag_WMscore", outDir)
+```
+
+## Compare with original stratified DEGs
+
+Load the original stratified DEG results (from `find_degs_limma.R`) and compare overlap.
+
+```{r compare-stratified}
+origDir <- "/home/zhijiany/workdir/2026/0402_AD_PaperReviews/data/AD/DEG_per_subtype"
+
+# Read original stratified results if available
+deg_13_file <- file.path(origDir, "DEG_1_3_ADvsN_ROSMAP.txt")
+deg_2_file <- file.path(origDir, "DEG_2_ADvsN_ROSMAP.txt")
+
+if (file.exists(deg_13_file) && file.exists(deg_2_file)) {
+  deg_13_orig <- read.table(deg_13_file, header = TRUE, sep = "\t",
+                            stringsAsFactors = FALSE)
+  deg_2_orig <- read.table(deg_2_file, header = TRUE, sep = "\t",
+                           stringsAsFactors = FALSE)
+
+  # Filter to significant DEGs with same thresholds
+  padjCut <- 0.05
+  logFCCut <- 0.26
+
+  sig_13 <- deg_13_orig[deg_13_orig$adj.P.Val <= padjCut &
+                          abs(deg_13_orig$logFC) >= logFCCut, "ensid"]
+  sig_2 <- deg_2_orig[deg_2_orig$adj.P.Val <= padjCut &
+                        abs(deg_2_orig$logFC) >= logFCCut, "ensid"]
+  sig_orig_union <- union(sig_13, sig_2)
+
+  sig_m1 <- union(res_m1$up$ensid, res_m1$dn$ensid)
+
+  cat("Original stratified approach (adj.P <= 0.05 & |logFC| >= 0.26):\n")
+  cat("  GM (clus 1&3) DEGs:", length(sig_13), "\n")
+  cat("  WM (clus 2) DEGs:", length(sig_2), "\n")
+  cat("  Union:", length(sig_orig_union), "\n\n")
+  cat("Covariate model (adj.P <= 0.05 & |logFC| >= 0.26):\n")
+  cat("  Model 1 (~ diag + WM_score_c), diagAD:", length(sig_m1), "\n")
+
+  # Venn: Model 1 vs original union
+  pdf(file.path(outDir, "venn_stratified_vs_covariate.pdf"), width = 6, height = 5)
+  grid.draw(venn.diagram(
+    x = list("Stratified (union)" = sig_orig_union,
+             "Covariate (diag+WM)" = sig_m1),
+    filename = NULL,
+    fill = c("#B0AECC", "#B5A054"), alpha = 0.5,
+    main = "Stratified vs Covariate Model",
+    cat.pos = c(-20, 20), cat.dist = c(0.05, 0.05)
+  ))
+  dev.off()
+
+  # Three-way: stratified GM, stratified WM, covariate model
+  pdf(file.path(outDir, "venn_subtypes_vs_covariate.pdf"), width = 6, height = 5)
+  grid.draw(venn.diagram(
+    x = list("Strat GM (1&3)" = sig_13,
+             "Strat WM (2)" = sig_2,
+             "Covariate" = sig_m1),
+    filename = NULL,
+    fill = c("#B0AECC", "#7EC8B0", "#B5A054"), alpha = 0.5,
+    main = "Stratified subtypes vs Covariate Model"
+  ))
+  dev.off()
+
+} else {
+  cat("Original stratified DEG files not found. Skipping comparison.\n")
+}
+```
+
+## Volcano plots
+
+```{r volcano-plots, fig.width=10, fig.height=6}
+library(ggrepel)
+
+make_volcano <- function(resDf, title, padjCut = 0.05, logFCCut = 0.26, nLabel = 15) {
+  resDf$sig <- "NS"
+  resDf$sig[resDf$adj.P.Val <= padjCut & resDf$logFC >= logFCCut] <- "Up"
+  resDf$sig[resDf$adj.P.Val <= padjCut & resDf$logFC <= -logFCCut] <- "Down"
+  resDf$sig <- factor(resDf$sig, levels = c("Down", "NS", "Up"))
+
+  # Select top genes to label: highest -log10(adj.P.Val) among significant
+  sigGenes <- resDf[resDf$sig %in% c("Up", "Down"), ]
+  topGenes <- head(sigGenes[order(sigGenes$adj.P.Val), ], nLabel)
+  resDf$display_name <- ifelse(
+    is.na(resDf$symbol) | trimws(resDf$symbol) == "" | tolower(trimws(resDf$symbol)) == "na",
+    resDf$ensid,
+    resDf$symbol
+  )
+  resDf$label <- ifelse(resDf$ensid %in% topGenes$ensid, resDf$display_name, NA)
+
+  ggplot(resDf, aes(x = logFC, y = -log10(adj.P.Val), color = sig)) +
+    geom_point(size = 0.5, alpha = 0.5) +
+    scale_color_manual(values = c("Down" = "blue", "NS" = "grey70", "Up" = "red")) +
+    geom_hline(yintercept = -log10(padjCut), linetype = "dashed", color = "grey40") +
+    geom_vline(xintercept = c(-logFCCut, logFCCut), linetype = "dashed", color = "grey40") +
+    geom_text_repel(aes(label = label), size = 3, max.overlaps = 20,
+                    show.legend = FALSE) +
+    labs(title = title, x = "log2 Fold Change", y = "-log10(adj. P-value)") +
+    theme_bw() +
+    theme(legend.position = "bottom")
+}
+
+p <- make_volcano(res_m1$all, "~ diag + WM score")
+ggsave(file.path(outDir, "volcano_diag_WMscore.pdf"), p, width = 7, height = 5)
+p
+```
+
+## logFC distribution from saved covariate-model results
+
+```{r logfc-distribution, fig.width=10, fig.height=4.5}
+padjCut <- 0.05
+logFCCut <- 0.26
+
+degFile <- file.path(outDir, "DEG_model1_diag_WMscore_all.txt")
+deg_logfc_df <- read.table(
+  degFile,
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+deg_logfc_df <- prepare_logfc_distribution_df(
+  deg_logfc_df,
+  "Covariate model",
+  padjCut = padjCut,
+  logFCCut = logFCCut
+)
+
+p_logfc_hist <- ggplot(deg_logfc_df, aes(x = logFC, fill = significance)) +
+  geom_histogram(binwidth = 0.05, color = "white", alpha = 0.9) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") +
+  scale_fill_manual(values = c("Down" = "#3B6FB6", "Not significant" = "grey80", "Up" = "#C84C3A")) +
+  labs(
+    title = "Distribution of logFC values from saved covariate-model results",
+    subtitle = "File: DEG_model1_diag_WMscore_all.txt; colors mark DEG significance",
+    x = "log2 Fold Change",
+    y = "Number of genes",
+    fill = NULL
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+cat("Genes loaded from saved results:", nrow(deg_logfc_df), "\n")
+cat("Significant DEGs in saved results:", sum(deg_logfc_df$significance %in% c("Down", "Up")), "\n")
+
+ggsave(file.path(outDir, "logFC_distribution_model1_from_file.pdf"), p_logfc_hist,
+       width = 8, height = 4.5)
+
+p_logfc_hist
+```
+
+## Raw p-value distribution from saved covariate-model results
+
+```{r pvalue-distribution, fig.width=10, fig.height=4.5}
+pvalueFile <- file.path(outDir, "DEG_model1_diag_WMscore_all.txt")
+pvalue_df <- read.table(
+  pvalueFile,
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+pvalue_df <- prepare_pvalue_distribution_df(
+  pvalue_df,
+  "Covariate model",
+  padjCut = padjCut,
+  logFCCut = logFCCut
+)
+
+p_pvalue_hist <- ggplot(pvalue_df, aes(x = P.Value, fill = significance)) +
+  geom_histogram(binwidth = 0.02, color = "white", alpha = 0.9, boundary = 0) +
+  scale_fill_manual(values = c("Down" = "#3B6FB6", "Not significant" = "grey80", "Up" = "#C84C3A")) +
+  labs(
+    title = "Distribution of raw p-values from saved covariate-model results",
+    subtitle = "File: DEG_model1_diag_WMscore_all.txt; colors mark DEG significance",
+    x = "Raw p-value",
+    y = "Number of genes",
+    fill = NULL
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+cat("Genes loaded from saved p-value results:", nrow(pvalue_df), "\n")
+cat("Genes with raw P.Value < 0.05:", sum(pvalue_df$P.Value < 0.05), "\n")
+
+ggsave(file.path(outDir, "pvalue_distribution_model1_from_file.pdf"), p_pvalue_hist,
+       width = 8, height = 4.5)
+
+p_pvalue_hist
+```
+
+## logFC distribution for stratified DEG result files
+
+```{r logfc-distribution-stratified, fig.width=12, fig.height=4.8}
+deg_13_file <- "/home/zhijiany/workdir/2026/0402_AD_PaperReviews/data/AD/DEG_per_subtype/DEG_1_3_ADvsN_ROSMAP.txt"
+deg_2_file <- "/home/zhijiany/workdir/2026/0402_AD_PaperReviews/data/AD/DEG_per_subtype/DEG_2_ADvsN_ROSMAP.txt"
+
+deg_13_df <- read.table(
+  deg_13_file,
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+deg_2_df <- read.table(
+  deg_2_file,
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+deg_13_df <- prepare_logfc_distribution_df(
+  deg_13_df,
+  "Stratified GM (clus 1&3)",
+  padjCut = padjCut,
+  logFCCut = logFCCut
+)
+deg_2_df <- prepare_logfc_distribution_df(
+  deg_2_df,
+  "Stratified WM (clus 2)",
+  padjCut = padjCut,
+  logFCCut = logFCCut
+)
+
+deg_stratified_logfc_df <- rbind(deg_13_df, deg_2_df)
+
+cat("Genes loaded from DEG_1_3_ADvsN_ROSMAP.txt:", nrow(deg_13_df), "\n")
+cat("Significant DEGs in DEG_1_3_ADvsN_ROSMAP.txt:",
+    sum(deg_13_df$significance %in% c("Down", "Up")), "\n")
+cat("Genes loaded from DEG_2_ADvsN_ROSMAP.txt:", nrow(deg_2_df), "\n")
+cat("Significant DEGs in DEG_2_ADvsN_ROSMAP.txt:",
+    sum(deg_2_df$significance %in% c("Down", "Up")), "\n")
+
+p_logfc_stratified <- ggplot(deg_stratified_logfc_df, aes(x = logFC, fill = significance)) +
+  geom_histogram(binwidth = 0.05, color = "white", alpha = 0.9) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") +
+  facet_wrap(~comparison, ncol = 2) +
+  scale_fill_manual(values = c("Down" = "#3B6FB6", "Not significant" = "grey80", "Up" = "#C84C3A")) +
+  labs(
+    title = "Distribution of logFC values for stratified DEG result files",
+    subtitle = "Files: DEG_1_3_ADvsN_ROSMAP.txt and DEG_2_ADvsN_ROSMAP.txt",
+    x = "log2 Fold Change",
+    y = "Number of genes",
+    fill = NULL
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+ggsave(file.path(outDir, "logFC_distribution_stratified_models.pdf"), p_logfc_stratified,
+       width = 10, height = 4.8)
+
+p_logfc_stratified
+```
+
+## Raw p-value distribution for stratified DEG result files
+
+```{r pvalue-distribution-stratified, fig.width=12, fig.height=4.8}
+deg_13_pval_df <- prepare_pvalue_distribution_df(
+  deg_13_df,
+  "Stratified GM (clus 1&3)",
+  padjCut = padjCut,
+  logFCCut = logFCCut
+)
+deg_2_pval_df <- prepare_pvalue_distribution_df(
+  deg_2_df,
+  "Stratified WM (clus 2)",
+  padjCut = padjCut,
+  logFCCut = logFCCut
+)
+
+deg_stratified_pval_df <- rbind(deg_13_pval_df, deg_2_pval_df)
+
+p_pvalue_stratified <- ggplot(deg_stratified_pval_df, aes(x = P.Value, fill = significance)) +
+  geom_histogram(binwidth = 0.02, color = "white", alpha = 0.9, boundary = 0) +
+  facet_wrap(~comparison, ncol = 2) +
+  scale_fill_manual(values = c("Down" = "#3B6FB6", "Not significant" = "grey80", "Up" = "#C84C3A")) +
+  labs(
+    title = "Distribution of raw p-values for stratified DEG result files",
+    subtitle = "Files: DEG_1_3_ADvsN_ROSMAP.txt and DEG_2_ADvsN_ROSMAP.txt",
+    x = "Raw p-value",
+    y = "Number of genes",
+    fill = NULL
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+cat("Genes with raw P.Value < 0.05 in DEG_1_3_ADvsN_ROSMAP.txt:",
+    sum(deg_13_pval_df$P.Value < 0.05), "\n")
+cat("Genes with raw P.Value < 0.05 in DEG_2_ADvsN_ROSMAP.txt:",
+    sum(deg_2_pval_df$P.Value < 0.05), "\n")
+
+ggsave(file.path(outDir, "pvalue_distribution_stratified_models.pdf"), p_pvalue_stratified,
+       width = 10, height = 4.8)
+
+p_pvalue_stratified
+```
+
+## Effect of WM score on gene expression (Model 1)
+
+Extract the coefficient for `WM_score_c` to see which genes are most associated with WM composition in the additive model.
+
+```{r wm-score-effect}
+fit_wm <- lmFit(countDf1, design1)
+fit_wm <- eBayes(fit_wm)
+fitRes_wm <- topTable(fit_wm, coef = "WM_score_c", adjust = "BH", n = Inf)
+
+resDf_wm <- data.frame(ensid = rownames(fitRes_wm), fitRes_wm, check.names = FALSE)
+resDf_wm <- merge(resDf_wm, geneIDNameDf, by.x = "ensid", by.y = "ensid", all.x = TRUE)
+resDf_wm <- resDf_wm[order(resDf_wm$adj.P.Val), ]
+
+cat("Genes significantly associated with WM score (adj.P <= 0.05):",
+    sum(resDf_wm$adj.P.Val <= 0.05), "\n")
+
+write.table(resDf_wm, file = file.path(outDir, "WM_score_effect_all.txt"),
+            sep = "\t", row.names = FALSE, quote = FALSE)
+
+head(resDf_wm, 20)
+```
+
+## GO enrichment analysis on covariate-adjusted DEGs
+
+```{r go-enrichment, fig.width=10, fig.height=8}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+# Use Ensembl IDs directly so DEGs with missing symbols are retained.
+sig_genes <- rbind(res_m1$up, res_m1$dn)
+
+go_all <- run_go_bp(sig_genes, "GO BP: All covariate-adjusted DEGs",
+                    "GO_BP_all_DEGs", outDir)
+go_up <- run_go_bp(res_m1$up, "GO BP: Up-regulated DEGs (AD > N)",
+                   "GO_BP_up_DEGs", outDir)
+go_dn <- run_go_bp(res_m1$dn, "GO BP: Down-regulated DEGs (AD < N)",
+                   "GO_BP_down_DEGs", outDir)
+```
+
+## Summary table
+
+```{r summary}
+summary_df <- data.frame(
+  Analysis = c(
+    "AD vs N DEG contrast (~ diag + WM_score_c; diagAD coef)",
+    "WM-score association (~ diag + WM_score_c; WM_score_c coef)"
+  ),
+  Significant = c(
+    nrow(res_m1$sig),
+    sum(resDf_wm$adj.P.Val <= 0.05)
+  ),
+  Positive = c(
+    nrow(res_m1$up),
+    sum(resDf_wm$adj.P.Val <= 0.05 & resDf_wm$logFC >= 0.26)
+  ),
+  Negative = c(
+    nrow(res_m1$dn),
+    sum(resDf_wm$adj.P.Val <= 0.05 & resDf_wm$logFC <= -0.26)
+  )
+)
+
+cat("Note: the WM-score row summarizes genes associated with WM_score_c, not an AD-vs-N DEG contrast.\n")
+print(summary_df)
+
+write.table(summary_df, file = file.path(outDir, "DEG_summary.txt"),
+            sep = "\t", row.names = FALSE, quote = FALSE)
+```
